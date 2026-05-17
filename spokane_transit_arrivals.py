@@ -1,243 +1,383 @@
 """
-Spokane Transit — Next Arrival Endpoint  (v3)
-==============================================
-Changes:
-  - Tries BOTH alpha stop_id (SPRFARWF) and numeric stop_code (2968)
-    when searching the feed, so it works regardless of which format
-    Spokane Transit uses in their real-time feed
-  - Added /debug?stop_id=2968 endpoint to inspect raw feed data
-  - Added /peek endpoint to dump the first few raw entity objects
-    so you can see the exact JSON structure of the live feed
+Spokane Transit — Arrival Board  (v4)
+======================================
+Output format per stop:
 
-Usage:
-  GET /next-arrival?stop_id=2968          <- works with numeric OR alpha
-  GET /debug?stop_id=2968                 <- shows what the feed has for this stop
-  GET /peek                               <- dumps raw feed structure (troubleshooting)
-  GET /health
+  Route #9 // 2:19 PM // 2:20 PM       ← scheduled // real-time (if different)
+  Route #9 // 2:49 PM // On Time        ← on-time (within 60s of schedule)
+  Route #9 // 3:19 PM                   ← no real-time data yet
+
+  Route #12 // Sprague @ Sherman // 2:25 PM // 2:27 PM
+  Route #12 // Sprague @ Sherman // 3:05 PM
+  Route #12 // Sprague @ Sherman // 3:45 PM // On Time
+
+Works with any stop — use the number on the bus stop sign:
+  GET /next-arrival?stop_id=2849
+  GET /next-arrival?stop_id=2968
+  GET /next-arrival?stop_id=SPRSHEEF   ← alpha stop_id also accepted
+
+Install:  pip install fastapi uvicorn requests pytz
+Run:      uvicorn spokane_transit_arrivals:app --reload
 """
 
-import requests
+import io
+import csv
+import zipfile
+import threading
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, date, time as dtime, timezone
+
 import pytz
-from datetime import datetime, timezone
+import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("sta")
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-GTFS_RT_FEED_URL = (
+GTFS_ZIP_URL   = "https://www.spokanetransit.com/gtfs"
+GTFS_RT_URL    = (
     "https://gtfsbridge.spokanetransit.com/realtime/"
     "GTFS-RealTime/TrapezeRealTimeFeed.json"
 )
-
-PACIFIC = pytz.timezone("America/Los_Angeles")
-GRACE_SECONDS = 30
+PACIFIC        = pytz.timezone("America/Los_Angeles")
+NUM_ARRIVALS   = 3      # next N arrivals shown per route
+GRACE_SECONDS  = 60     # seconds in the past still counted as "upcoming"
+ON_TIME_WINDOW = 60     # delay ≤ this many seconds = "On Time"
 
 # ---------------------------------------------------------------------------
-# Bidirectional stop lookup — alpha <-> numeric
+# In-memory GTFS cache (rebuilt daily at first request)
 # ---------------------------------------------------------------------------
-STOP_CODE_TO_ID = {
-    "2849": "SPRSHEEF",  # Sprague @ Sherman
-    "2968": "SPRFARWF",  # Sprague @ Farr (WinCo)
+_lock = threading.Lock()
+_gtfs: dict = {
+    "loaded_date": None,          # date object; rebuilt when date changes
+    "stops_by_code": {},          # "2849"    → {stop_id, stop_name}
+    "stops_by_id":   {},          # "SPRSHEEF"→ {stop_code, stop_name}
+    "trips":         {},          # trip_id   → {route_id, service_id}
+    "routes":        {},          # route_id  → short_name  e.g. "9"
+    "schedule":      {},          # stop_id   → [(unix_ts, trip_id), ...]
 }
-# Reverse map: alpha -> numeric
-STOP_ID_TO_CODE = {v: k for k, v in STOP_CODE_TO_ID.items()}
-
-ROUTE_NAMES = {
-    "9":  "Route 9 Sprague",
-    "12": "Route 12 Southside Medical",
-}
-
-app = FastAPI(title="Spokane Transit Next Arrival", version="3.0.0")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# GTFS static helpers
 # ---------------------------------------------------------------------------
-def get_both_ids(raw: str):
-    """
-    Given either a numeric code ('2968') or alpha id ('SPRFARWF'),
-    return a set containing BOTH forms so we can match either in the feed.
-    """
-    stripped = raw.strip().upper()
-    candidates = {stripped}
 
-    if stripped.isdigit():
-        alpha = STOP_CODE_TO_ID.get(stripped)
-        if alpha:
-            candidates.add(alpha)
-    else:
-        numeric = STOP_ID_TO_CODE.get(stripped)
-        if numeric:
-            candidates.add(numeric)
-
-    return candidates
+def _hms_to_secs(t: str) -> int:
+    """'14:19:00' or '25:30:00' → seconds from midnight (handles >24h)."""
+    h, m, s = t.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + int(s)
 
 
-def fetch_feed():
-    """Fetch the GTFS-RT feed. Returns (feed_dict, error_string)."""
+def _secs_to_unix(secs: int, service_date: date) -> float:
+    """Seconds-from-midnight + Pacific service date → Unix timestamp."""
+    extra = secs // 86400
+    rem   = secs %  86400
+    naive = datetime.combine(
+        service_date + timedelta(days=extra),
+        dtime(rem // 3600, (rem % 3600) // 60, rem % 60),
+    )
+    return PACIFIC.localize(naive).timestamp()
+
+
+def _load_gtfs() -> None:
+    """Download STA GTFS zip and rebuild the in-memory cache."""
+    today     = datetime.now(PACIFIC).date()
+    today_str = today.strftime("%Y%m%d")
+    day_name  = today.strftime("%A").lower()   # "monday" etc.
+
+    log.info("Downloading GTFS from %s …", GTFS_ZIP_URL)
+    resp = requests.get(GTFS_ZIP_URL, timeout=60)
+    resp.raise_for_status()
+    zf   = zipfile.ZipFile(io.BytesIO(resp.content))
+    names = set(zf.namelist())
+    log.info("GTFS zip downloaded. Files: %s", sorted(names))
+
+    # -- stops ----------------------------------------------------------------
+    stops_by_code: dict = {}
+    stops_by_id:   dict = {}
+    with zf.open("stops.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            sid  = row["stop_id"].strip()
+            code = row.get("stop_code", "").strip()
+            name = row.get("stop_name", "").strip()
+            stops_by_id[sid] = {"stop_code": code, "stop_name": name}
+            if code:
+                stops_by_code[code] = {"stop_id": sid, "stop_name": name}
+
+    # -- routes ---------------------------------------------------------------
+    routes: dict = {}
+    with zf.open("routes.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            rid   = row["route_id"].strip()
+            short = row.get("route_short_name", "").strip() or rid
+            routes[rid] = short
+
+    # -- trips ----------------------------------------------------------------
+    trips: dict = {}
+    with zf.open("trips.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            trips[row["trip_id"].strip()] = {
+                "route_id":   row["route_id"].strip(),
+                "service_id": row["service_id"].strip(),
+            }
+
+    # -- active services today ------------------------------------------------
+    active: set = set()
+    if "calendar.txt" in names:
+        with zf.open("calendar.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                if (row.get(day_name, "0") == "1"
+                        and row["start_date"] <= today_str <= row["end_date"]):
+                    active.add(row["service_id"].strip())
+
+    if "calendar_dates.txt" in names:
+        with zf.open("calendar_dates.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                if row["date"] == today_str:
+                    sid = row["service_id"].strip()
+                    if row["exception_type"] == "1":
+                        active.add(sid)
+                    elif row["exception_type"] == "2":
+                        active.discard(sid)
+
+    log.info("Active service IDs today: %s", active)
+    active_trips = {tid for tid, t in trips.items() if t["service_id"] in active}
+
+    # -- stop_times (only active trips) ---------------------------------------
+    schedule: dict = defaultdict(list)
+    with zf.open("stop_times.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            tid = row["trip_id"].strip()
+            if tid not in active_trips:
+                continue
+            sid = row["stop_id"].strip()
+            raw = (row.get("arrival_time") or row.get("departure_time") or "").strip()
+            if not raw:
+                continue
+            secs  = _hms_to_secs(raw)
+            unix  = _secs_to_unix(secs, today)
+            schedule[sid].append((unix, tid))
+
+    for sid in schedule:
+        schedule[sid].sort()
+
+    log.info("Schedule loaded: %d stops, %d active trips.", len(schedule), len(active_trips))
+
+    with _lock:
+        _gtfs["loaded_date"]   = today
+        _gtfs["stops_by_code"] = stops_by_code
+        _gtfs["stops_by_id"]   = stops_by_id
+        _gtfs["trips"]         = trips
+        _gtfs["routes"]        = routes
+        _gtfs["schedule"]      = dict(schedule)
+
+
+def _ensure_gtfs() -> str | None:
+    """Reload GTFS if stale (new day). Returns error string or None."""
+    with _lock:
+        loaded_date = _gtfs["loaded_date"]
+    today = datetime.now(PACIFIC).date()
+    if loaded_date != today:
+        try:
+            _load_gtfs()
+        except Exception as exc:
+            log.exception("GTFS load failed")
+            return f"Schedule data unavailable: {exc}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Real-time feed
+# ---------------------------------------------------------------------------
+
+def _fetch_rt() -> tuple[dict, str | None]:
     try:
-        resp = requests.get(GTFS_RT_FEED_URL, timeout=10)
-        resp.raise_for_status()
-        return resp.json(), None
-    except requests.exceptions.ConnectionError:
-        return None, "Error: could not connect to the transit feed"
-    except requests.exceptions.Timeout:
-        return None, "Error: transit feed timed out"
-    except requests.exceptions.HTTPError as e:
-        return None, f"Error: feed returned HTTP {e.response.status_code}"
-    except ValueError:
-        return None, "Error: feed returned invalid JSON"
+        r = requests.get(GTFS_RT_URL, timeout=10)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def _build_rt_index(feed: dict) -> dict:
+    """
+    Returns {trip_id: {stop_id: {"rt_time": float, "delay": int|None}}}
+    """
+    idx: dict = {}
+    for entity in feed.get("entity", []):
+        tu = entity.get("trip_update")
+        if not tu:
+            continue
+        trip_id = tu.get("trip", {}).get("trip_id", "")
+        if not trip_id:
+            continue
+        for stu in tu.get("stop_time_update", []):
+            sid = stu.get("stop_id", "")
+            evt = stu.get("arrival") or stu.get("departure") or {}
+            rt  = evt.get("time")
+            if rt is None:
+                continue
+            idx.setdefault(trip_id, {})[sid] = {
+                "rt_time": float(rt),
+                "delay":   evt.get("delay"),
+            }
+    return idx
 
 
 # ---------------------------------------------------------------------------
-# Core logic
+# Formatting
 # ---------------------------------------------------------------------------
-def find_next_arrival(stop_id_raw: str) -> str:
-    feed, err = fetch_feed()
+
+def _fmt(unix_ts: float) -> str:
+    return datetime.fromtimestamp(unix_ts, tz=PACIFIC).strftime("%-I:%M %p")
+
+
+def _build_lines(stop_id: str, stop_name: str, rt_idx: dict, now_ts: float) -> list[str]:
+    cutoff   = now_ts - GRACE_SECONDS
+    schedule = _gtfs["schedule"]
+    trips    = _gtfs["trips"]
+    routes   = _gtfs["routes"]
+
+    # Gather upcoming arrivals, group by route (capped at NUM_ARRIVALS each)
+    by_route: dict = defaultdict(list)
+    for unix_ts, trip_id in schedule.get(stop_id, []):
+        if unix_ts < cutoff:
+            continue
+        route_id = trips.get(trip_id, {}).get("route_id", "?")
+        if len(by_route[route_id]) < NUM_ARRIVALS:
+            by_route[route_id].append((unix_ts, trip_id))
+
+    if not by_route:
+        return ["No upcoming arrivals"]
+
+    # Sort routes numerically where possible, alpha otherwise
+    def _route_sort_key(rid):
+        short = routes.get(rid, rid)
+        try:
+            return (0, int(short), short)
+        except ValueError:
+            return (1, 0, short)
+
+    lines: list[str] = []
+    for route_idx, route_id in enumerate(sorted(by_route, key=_route_sort_key)):
+        short   = routes.get(route_id, route_id)
+        include_stop_name = (route_idx > 0)   # second+ routes show stop name
+
+        if lines:
+            lines.append("")   # blank line between route groups
+
+        for sched_ts, trip_id in by_route[route_id]:
+            sched_str = _fmt(sched_ts)
+
+            # Real-time lookup
+            rt_info = rt_idx.get(trip_id, {}).get(stop_id)
+            if rt_info:
+                rt_ts  = rt_info["rt_time"]
+                delay  = rt_info.get("delay") or 0
+                rt_str = "On Time" if abs(delay) <= ON_TIME_WINDOW else _fmt(rt_ts)
+            else:
+                rt_str = None
+
+            # Assemble line
+            parts = [f"Route #{short}"]
+            if include_stop_name:
+                parts.append(stop_name)
+            parts.append(sched_str)
+            if rt_str:
+                parts.append(rt_str)
+
+            lines.append(" // ".join(parts))
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Resolver
+# ---------------------------------------------------------------------------
+
+def _resolve(raw: str) -> tuple[str | None, str]:
+    """(stop_id, stop_name) or (None, error_msg)."""
+    s = raw.strip()
+    if s.isdigit():
+        info = _gtfs["stops_by_code"].get(s)
+        if not info:
+            return None, f"Stop code {s} not found in schedule data"
+        return info["stop_id"], info["stop_name"]
+    s = s.upper()
+    info = _gtfs["stops_by_id"].get(s)
+    if not info:
+        return None, f"Stop ID '{s}' not found in schedule data"
+    return s, info["stop_name"]
+
+
+# ---------------------------------------------------------------------------
+# Main function
+# ---------------------------------------------------------------------------
+
+def get_arrivals(stop_input: str) -> str:
+    err = _ensure_gtfs()
     if err:
         return err
 
-    candidates = get_both_ids(stop_id_raw)
-    now_ts = datetime.now(timezone.utc).timestamp()
-    cutoff = now_ts - GRACE_SECONDS
+    stop_id, result = _resolve(stop_input)
+    if stop_id is None:
+        return result   # error message
+    stop_name = result
 
-    best_ts = None
-    best_route = ""
+    feed, _ = _fetch_rt()
+    rt_idx   = _build_rt_index(feed) if feed else {}
+    now_ts   = datetime.now(timezone.utc).timestamp()
 
-    for entity in feed.get("entity", []):
-        trip_update = entity.get("trip_update")
-        if not trip_update:
-            continue
-
-        route_id = trip_update.get("trip", {}).get("route_id", "")
-
-        for stu in trip_update.get("stop_time_update", []):
-            if stu.get("stop_id") not in candidates:
-                continue
-
-            time_event = stu.get("arrival") or stu.get("departure")
-            if not time_event:
-                continue
-
-            arrival_ts = time_event.get("time")
-            if arrival_ts is None:
-                continue
-
-            arrival_ts = float(arrival_ts)
-            if arrival_ts < cutoff:
-                continue
-
-            if best_ts is None or arrival_ts < best_ts:
-                best_ts = arrival_ts
-                best_route = route_id
-
-    if best_ts is None:
-        return "No upcoming arrivals"
-
-    arrival_dt = datetime.fromtimestamp(best_ts, tz=PACIFIC)
-    time_str = arrival_dt.strftime("%-I:%M %p")
-    route_name = ROUTE_NAMES.get(best_route, f"Route {best_route}" if best_route else "")
-
-    return f"{time_str} — {route_name}" if route_name else time_str
+    lines = _build_lines(stop_id, stop_name, rt_idx, now_ts)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# FastAPI routes
 # ---------------------------------------------------------------------------
+
+app = FastAPI(title="Spokane Transit Arrival Board", version="4.0.0")
+
+
+@app.on_event("startup")
+def startup_event():
+    """Pre-load GTFS in background so first request isn't slow."""
+    t = threading.Thread(target=_load_gtfs, daemon=True)
+    t.start()
+
+
 @app.get("/next-arrival", response_class=PlainTextResponse)
-def next_arrival(stop_id: str = Query(..., min_length=1)):
-    return find_next_arrival(stop_id)
-
-
-@app.get("/debug")
-def debug(stop_id: str = Query(..., min_length=1)):
-    """
-    Returns every stop_time_update entry from the live feed that matches
-    this stop (trying both numeric and alpha forms). Use this to verify
-    the feed is seeing your stop and to inspect the raw time values.
-    """
-    feed, err = fetch_feed()
-    if err:
-        return JSONResponse({"error": err})
-
-    candidates = get_both_ids(stop_id)
-    now_ts = datetime.now(timezone.utc).timestamp()
-    matches = []
-
-    for entity in feed.get("entity", []):
-        trip_update = entity.get("trip_update")
-        if not trip_update:
-            continue
-
-        route_id = trip_update.get("trip", {}).get("route_id", "")
-        trip_id  = trip_update.get("trip", {}).get("trip_id", "")
-
-        for stu in trip_update.get("stop_time_update", []):
-            if stu.get("stop_id") not in candidates:
-                continue
-
-            arrival_ts   = (stu.get("arrival")   or {}).get("time")
-            departure_ts = (stu.get("departure")  or {}).get("time")
-
-            def fmt(ts):
-                if ts is None:
-                    return None
-                dt = datetime.fromtimestamp(float(ts), tz=PACIFIC)
-                return dt.strftime("%-I:%M %p") + f" (unix {ts})"
-
-            matches.append({
-                "route_id":    route_id,
-                "trip_id":     trip_id,
-                "feed_stop_id": stu.get("stop_id"),
-                "arrival":     fmt(arrival_ts),
-                "departure":   fmt(departure_ts),
-                "in_past":     (float(arrival_ts) < now_ts) if arrival_ts else None,
-            })
-
-    matches.sort(key=lambda x: x.get("arrival") or "")
-
-    return JSONResponse({
-        "queried_stop":   stop_id,
-        "candidates_tried": list(candidates),
-        "now_pacific":    datetime.fromtimestamp(now_ts, tz=PACIFIC).strftime("%-I:%M %p"),
-        "total_entities": len(feed.get("entity", [])),
-        "matches_found":  len(matches),
-        "matches":        matches,
-    })
-
-
-@app.get("/peek")
-def peek():
-    """
-    Dumps the first 3 raw entities from the live feed so you can see
-    the exact JSON structure Spokane Transit uses.
-    """
-    feed, err = fetch_feed()
-    if err:
-        return JSONResponse({"error": err})
-
-    entities = feed.get("entity", [])
-    return JSONResponse({
-        "total_entities": len(entities),
-        "sample": entities[:3],
-    })
+def next_arrival(
+    stop_id: str = Query(
+        ...,
+        description="Bus stop number (e.g. 2849) or alpha stop ID (e.g. SPRSHEEF)",
+        min_length=1,
+    )
+):
+    return get_arrivals(stop_id)
 
 
 @app.get("/health", response_class=PlainTextResponse)
 def health():
-    return "ok"
+    with _lock:
+        d = _gtfs["loaded_date"]
+    return f"ok — schedule loaded for {d}" if d else "ok — schedule loading…"
 
 
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
-        "Spokane Transit API v3\n"
-        "Endpoints:\n"
-        "  /next-arrival?stop_id=2968\n"
-        "  /debug?stop_id=2968\n"
-        "  /peek\n"
-        "  /health"
+        "Spokane Transit Arrival Board v4\n"
+        "─────────────────────────────────\n"
+        "GET /next-arrival?stop_id=2849\n"
+        "GET /next-arrival?stop_id=2968\n"
+        "GET /next-arrival?stop_id=<any stop number>\n"
+        "GET /health"
     )
 
 
