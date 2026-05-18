@@ -1,25 +1,31 @@
 """
 Spokane Transit — Arrival Board  (v5)
 ======================================
-Output format per stop:
+New in v5
+---------
+  • Hardcoded stops (2968 / 2849 / 2884) with display names
+  • /next-arrival-json  → structured JSON for Apple Shortcuts bus-picker
+      menu_items list   → ready-made strings for "Choose from List"
+      departure_unix    → exact departure timestamp
+      minutes_until     → countdown already computed server-side
+      stop_lat / lon    → for "Get Travel Time" in Shortcuts
+  • /schedule           → full day timetable for any stop + any date
+      &format=text (default)  plain-text grouped by route
+      &format=json            machine-readable array
+  • /stops              → list hard-coded stops as JSON
 
+Plain-text output (unchanged from v4):
   Route #9 // 2:19 PM // 2:20 PM       ← scheduled // real-time (if different)
-  Route #9 // 2:49 PM // On Time        ← on-time (within 60s of schedule)
-  Route #9 // 3:19 PM                   ← no real-time data yet
+  Route #9 // 2:49 PM // On Time
+  Route #9 // 3:19 PM
 
   Route #12 // Sprague @ Sherman // 2:25 PM // 2:27 PM
-  Route #12 // Sprague @ Sherman // 3:05 PM
-  Route #12 // Sprague @ Sherman // 3:45 PM // On Time
 
-Works with any stop — use the number on the bus stop sign:
-  GET /next-arrival?stop_id=2849
-  GET /next-arrival?stop_id=2968
-  GET /next-arrival?stop_id=SPRSHEEF   ← alpha stop_id also accepted
-
-NEW — JSON endpoint for Apple Shortcuts:
-  GET /next-arrival-json?stop_id=2968
-  GET /next-arrival-json?stop_id=2968&dest_stop_id=2849
-  GET /search-stops?q=sprague
+Menu item format (for /next-arrival-json → menu_items):
+  "Route #9 // 2:19 PM // On Time // 14 min"
+  "Route #9 // 2:49 PM // +2 min // 44 min"
+  "Route #9 // 3:19 PM // Scheduled // 74 min"
+  Split on " // " → [route, scheduled_time, status, minutes_until]
 
 Install:  pip install fastapi uvicorn requests pytz
 Run:      uvicorn spokane_transit_arrivals:app --reload
@@ -30,7 +36,7 @@ import csv
 import zipfile
 import threading
 import logging
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta, date, time as dtime, timezone
 
 import pytz
@@ -42,36 +48,80 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sta")
 
 # ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 GTFS_ZIP_URL   = "https://www.spokanetransit.com/gtfs"
 GTFS_RT_URL    = (
     "https://gtfsbridge.spokanetransit.com/realtime/"
     "GTFS-RealTime/TrapezeRealTimeFeed.json"
 )
 PACIFIC        = pytz.timezone("America/Los_Angeles")
-NUM_ARRIVALS   = 3      # next N arrivals shown per route
-GRACE_SECONDS  = 60     # seconds in the past still counted as "upcoming"
-ON_TIME_WINDOW = 60     # delay ≤ this many seconds = "On Time"
+NUM_ARRIVALS   = 3       # next N arrivals shown per route in /next-arrival
+GRACE_SECONDS  = 60      # seconds in the past still counted as "upcoming"
+ON_TIME_WINDOW = 60      # delay ≤ this many seconds = "On Time"
 
-# Hardcoded favorite stops — use the name or code in any endpoint
-PRESET_STOPS = {
-    "farr":      {"stop_code": "2968", "name": "Sprague @ Farr (Winco)"},
-    "sherman":   {"stop_code": "2849", "name": "Sprague @ Sherman"},
-    "appleway":  {"stop_code": "2884", "name": "Appleway @ Farr (Winco)"},
-}
+# Hard-coded stops  stop_code → display name
+HARDCODED_STOPS: OrderedDict = OrderedDict([
+    ("2968", "Sprague @ Farr (Winco)"),
+    ("2849", "Sprague @ Sherman"),
+    ("2884", "Appleway @ Farr (Winco)"),
+])
 
+# ---------------------------------------------------------------------------
+# GTFS zip cache  (raw bytes, re-downloaded once per day)
+# ---------------------------------------------------------------------------
+_zip_lock  = threading.Lock()
+_zip_cache: dict = {"bytes": None, "fetched_date": None}
+
+
+def _ensure_zip():
+    """
+    Return (ZipFile, None) built from cached bytes, or (None, error_str).
+    Re-downloads the zip once per Pacific day.
+    Falls back to a stale zip rather than returning an error when possible.
+    """
+    today = datetime.now(PACIFIC).date()
+    with _zip_lock:
+        if _zip_cache["fetched_date"] != today or _zip_cache["bytes"] is None:
+            log.info("Downloading GTFS zip from %s …", GTFS_ZIP_URL)
+            try:
+                resp = requests.get(GTFS_ZIP_URL, timeout=60)
+                resp.raise_for_status()
+                _zip_cache["bytes"]        = resp.content
+                _zip_cache["fetched_date"] = today
+                log.info("GTFS zip downloaded (%d bytes).", len(resp.content))
+            except Exception as exc:
+                log.exception("GTFS zip download failed.")
+                if _zip_cache["bytes"] is None:
+                    return None, f"Schedule data unavailable: {exc}"
+                log.warning("Using stale GTFS zip from %s.", _zip_cache["fetched_date"])
+        raw = _zip_cache["bytes"]
+    try:
+        return zipfile.ZipFile(io.BytesIO(raw)), None
+    except Exception as exc:
+        return None, f"Corrupt GTFS zip: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# In-memory GTFS cache  (today's schedule + lookup tables)
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _gtfs: dict = {
-    "loaded_date": None,          # date object; rebuilt when date changes
-    "stops_by_code": {},          # "2849"    → {stop_id, stop_name}
-    "stops_by_id":   {},          # "SPRSHEEF"→ {stop_code, stop_name}
-    "trips":         {},          # trip_id   → {route_id, service_id}
-    "routes":        {},          # route_id  → short_name  e.g. "9"
-    "schedule":      {},          # stop_id   → [(unix_ts, trip_id), ...]
+    "loaded_date":  None,          # date; rebuilt when date changes
+    "stops_by_code": {},           # "2849"     → {stop_id, stop_name, lat, lon}
+    "stops_by_id":   {},           # "SPRSHEEF" → {stop_code, stop_name, lat, lon}
+    "trips":         {},           # trip_id    → {route_id, service_id}
+    "routes":        {},           # route_id   → short_name
+    "schedule":      {},           # stop_id    → [(unix_ts, trip_id), …]  ALL today
 }
 
+
+# ---------------------------------------------------------------------------
+# GTFS static helpers
+# ---------------------------------------------------------------------------
+
 def _hms_to_secs(t: str) -> int:
-    """'14:19:00' or '25:30:00' → seconds from midnight (handles >24h)."""
+    """'14:19:00' or '25:30:00' → seconds-from-midnight (handles >24h)."""
     h, m, s = t.strip().split(":")
     return int(h) * 3600 + int(m) * 60 + int(s)
 
@@ -87,20 +137,40 @@ def _secs_to_unix(secs: int, service_date: date) -> float:
     return PACIFIC.localize(naive).timestamp()
 
 
+def _get_active_services(zf: zipfile.ZipFile, names: set,
+                          date_str: str, day_name: str) -> set:
+    """Return set of active service_ids for the given date/day_name."""
+    active: set = set()
+    if "calendar.txt" in names:
+        with zf.open("calendar.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                if (row.get(day_name, "0") == "1"
+                        and row["start_date"] <= date_str <= row["end_date"]):
+                    active.add(row["service_id"].strip())
+    if "calendar_dates.txt" in names:
+        with zf.open("calendar_dates.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                if row["date"] == date_str:
+                    sid = row["service_id"].strip()
+                    if row["exception_type"] == "1":
+                        active.add(sid)
+                    elif row["exception_type"] == "2":
+                        active.discard(sid)
+    return active
+
+
 def _load_gtfs() -> None:
-    """Download STA GTFS zip and rebuild the in-memory cache."""
+    """Download (or use cached) GTFS zip and rebuild today's in-memory schedule."""
     today     = datetime.now(PACIFIC).date()
     today_str = today.strftime("%Y%m%d")
-    day_name  = today.strftime("%A").lower()   # "monday" etc.
+    day_name  = today.strftime("%A").lower()
 
-    log.info("Downloading GTFS from %s …", GTFS_ZIP_URL)
-    resp = requests.get(GTFS_ZIP_URL, timeout=60)
-    resp.raise_for_status()
-    zf   = zipfile.ZipFile(io.BytesIO(resp.content))
+    zf, err = _ensure_zip()
+    if err:
+        raise RuntimeError(err)
     names = set(zf.namelist())
-    log.info("GTFS zip downloaded. Files: %s", sorted(names))
 
-    # -- stops ----------------------------------------------------------------
+    # -- stops (include lat/lon for Shortcuts "Get Travel Time") ---------------
     stops_by_code: dict = {}
     stops_by_id:   dict = {}
     with zf.open("stops.txt") as f:
@@ -108,11 +178,14 @@ def _load_gtfs() -> None:
             sid  = row["stop_id"].strip()
             code = row.get("stop_code", "").strip()
             name = row.get("stop_name", "").strip()
-            stops_by_id[sid] = {"stop_code": code, "stop_name": name}
+            lat  = _safe_float(row.get("stop_lat", ""))
+            lon  = _safe_float(row.get("stop_lon", ""))
+            entry = {"stop_code": code, "stop_name": name, "lat": lat, "lon": lon}
+            stops_by_id[sid] = entry
             if code:
-                stops_by_code[code] = {"stop_id": sid, "stop_name": name}
+                stops_by_code[code] = {**entry, "stop_id": sid}
 
-    # -- routes ---------------------------------------------------------------
+    # -- routes ----------------------------------------------------------------
     routes: dict = {}
     with zf.open("routes.txt") as f:
         for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
@@ -120,7 +193,7 @@ def _load_gtfs() -> None:
             short = row.get("route_short_name", "").strip() or rid
             routes[rid] = short
 
-    # -- trips ----------------------------------------------------------------
+    # -- trips -----------------------------------------------------------------
     trips: dict = {}
     with zf.open("trips.txt") as f:
         for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
@@ -129,29 +202,13 @@ def _load_gtfs() -> None:
                 "service_id": row["service_id"].strip(),
             }
 
-    # -- active services today ------------------------------------------------
-    active: set = set()
-    if "calendar.txt" in names:
-        with zf.open("calendar.txt") as f:
-            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
-                if (row.get(day_name, "0") == "1"
-                        and row["start_date"] <= today_str <= row["end_date"]):
-                    active.add(row["service_id"].strip())
-
-    if "calendar_dates.txt" in names:
-        with zf.open("calendar_dates.txt") as f:
-            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
-                if row["date"] == today_str:
-                    sid = row["service_id"].strip()
-                    if row["exception_type"] == "1":
-                        active.add(sid)
-                    elif row["exception_type"] == "2":
-                        active.discard(sid)
-
-    log.info("Active service IDs today: %s", active)
+    # -- active services today -------------------------------------------------
+    active       = _get_active_services(zf, names, today_str, day_name)
     active_trips = {tid for tid, t in trips.items() if t["service_id"] in active}
+    log.info("Active service IDs today: %d  |  Active trips: %d",
+             len(active), len(active_trips))
 
-    # -- stop_times (only active trips) ---------------------------------------
+    # -- stop_times  (only active trips, ALL times — no cutoff here) -----------
     schedule: dict = defaultdict(list)
     with zf.open("stop_times.txt") as f:
         for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
@@ -162,14 +219,14 @@ def _load_gtfs() -> None:
             raw = (row.get("arrival_time") or row.get("departure_time") or "").strip()
             if not raw:
                 continue
-            secs  = _hms_to_secs(raw)
-            unix  = _secs_to_unix(secs, today)
+            secs = _hms_to_secs(raw)
+            unix = _secs_to_unix(secs, today)
             schedule[sid].append((unix, tid))
 
     for sid in schedule:
         schedule[sid].sort()
 
-    log.info("Schedule loaded: %d stops, %d active trips.", len(schedule), len(active_trips))
+    log.info("Schedule loaded: %d stops.", len(schedule))
 
     with _lock:
         _gtfs["loaded_date"]   = today
@@ -180,8 +237,15 @@ def _load_gtfs() -> None:
         _gtfs["schedule"]      = dict(schedule)
 
 
+def _safe_float(s: str):
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _ensure_gtfs() -> str | None:
-    """Reload GTFS if stale (new day). Returns error string or None."""
+    """Reload today's schedule if stale. Returns error string or None."""
     with _lock:
         loaded_date = _gtfs["loaded_date"]
     today = datetime.now(PACIFIC).date()
@@ -189,12 +253,106 @@ def _ensure_gtfs() -> str | None:
         try:
             _load_gtfs()
         except Exception as exc:
-            log.exception("GTFS load failed")
+            log.exception("GTFS load failed.")
             return f"Schedule data unavailable: {exc}"
     return None
 
+
 # ---------------------------------------------------------------------------
-def _fetch_rt() -> tuple[dict, str | None]:
+# Full-day schedule for arbitrary date  (used by /schedule endpoint)
+# ---------------------------------------------------------------------------
+
+def _get_full_day_schedule(stop_id: str, target_date: date) -> tuple:
+    """
+    Returns (arrivals_list, error_or_None).
+    Each arrival dict: {route_short, scheduled_unix, scheduled_time, trip_id}
+    Sorted by scheduled_unix.
+    Reuses _gtfs routes/trips lookup tables when available.
+    """
+    today = datetime.now(PACIFIC).date()
+
+    # Fast path: today → use already-parsed schedule
+    if target_date == today:
+        with _lock:
+            if _gtfs["loaded_date"] == today:
+                routes = _gtfs["routes"]
+                trips  = _gtfs["trips"]
+                raw    = _gtfs["schedule"].get(stop_id, [])
+                arrivals = []
+                for unix_ts, trip_id in raw:
+                    route_id = trips.get(trip_id, {}).get("route_id", "?")
+                    arrivals.append({
+                        "route_short":    routes.get(route_id, route_id),
+                        "scheduled_unix": unix_ts,
+                        "scheduled_time": _fmt(unix_ts),
+                        "trip_id":        trip_id,
+                    })
+                return arrivals, None
+
+    # Slow path: different date → parse from zip
+    zf, err = _ensure_zip()
+    if err:
+        return [], err
+
+    names    = set(zf.namelist())
+    date_str = target_date.strftime("%Y%m%d")
+    day_name = target_date.strftime("%A").lower()
+
+    # Reuse cached routes/trips if available
+    with _lock:
+        cached_routes = dict(_gtfs["routes"]) if _gtfs["loaded_date"] else None
+        cached_trips  = dict(_gtfs["trips"])  if _gtfs["loaded_date"] else None
+
+    if cached_routes is None:
+        cached_routes = {}
+        with zf.open("routes.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                cached_routes[row["route_id"].strip()] = (
+                    row.get("route_short_name", "").strip() or row["route_id"].strip()
+                )
+
+    if cached_trips is None:
+        cached_trips = {}
+        with zf.open("trips.txt") as f:
+            for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                cached_trips[row["trip_id"].strip()] = {
+                    "route_id":   row["route_id"].strip(),
+                    "service_id": row["service_id"].strip(),
+                }
+
+    active       = _get_active_services(zf, names, date_str, day_name)
+    active_trips = {tid for tid, t in cached_trips.items() if t["service_id"] in active}
+
+    arrivals: list = []
+    with zf.open("stop_times.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            tid = row["trip_id"].strip()
+            if tid not in active_trips:
+                continue
+            if row["stop_id"].strip() != stop_id:
+                continue
+            raw = (row.get("arrival_time") or row.get("departure_time") or "").strip()
+            if not raw:
+                continue
+            secs    = _hms_to_secs(raw)
+            unix_ts = _secs_to_unix(secs, target_date)
+            route_id = cached_trips[tid]["route_id"]
+            arrivals.append({
+                "route_short":    cached_routes.get(route_id, route_id),
+                "scheduled_unix": unix_ts,
+                "scheduled_time": _fmt(unix_ts),
+                "trip_id":        tid,
+            })
+
+    arrivals.sort(key=lambda x: x["scheduled_unix"])
+    return arrivals, None
+
+
+# ---------------------------------------------------------------------------
+# Real-time feed
+# ---------------------------------------------------------------------------
+
+def _fetch_rt() -> tuple:
     try:
         r = requests.get(GTFS_RT_URL, timeout=10)
         r.raise_for_status()
@@ -204,9 +362,7 @@ def _fetch_rt() -> tuple[dict, str | None]:
 
 
 def _build_rt_index(feed: dict) -> dict:
-    """
-    Returns {trip_id: {stop_id: {"rt_time": float, "delay": int|None}}}
-    """
+    """Returns {trip_id: {stop_id: {rt_time, delay}}}."""
     idx: dict = {}
     for entity in feed.get("entity", []):
         tu = entity.get("trip_update")
@@ -227,18 +383,33 @@ def _build_rt_index(feed: dict) -> dict:
             }
     return idx
 
+
 # ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
 def _fmt(unix_ts: float) -> str:
     return datetime.fromtimestamp(unix_ts, tz=PACIFIC).strftime("%-I:%M %p")
 
 
-def _build_lines(stop_id: str, stop_name: str, rt_idx: dict, now_ts: float) -> list[str]:
+def _route_sort_key(rid: str, routes: dict):
+    short = routes.get(rid, rid)
+    try:
+        return (0, int(short), short)
+    except ValueError:
+        return (1, 0, short)
+
+
+# ---------------------------------------------------------------------------
+# Plain-text arrivals  (unchanged behaviour from v4)
+# ---------------------------------------------------------------------------
+
+def _build_lines(stop_id: str, stop_name: str, rt_idx: dict, now_ts: float) -> list:
     cutoff   = now_ts - GRACE_SECONDS
     schedule = _gtfs["schedule"]
     trips    = _gtfs["trips"]
     routes   = _gtfs["routes"]
 
-    # Gather upcoming arrivals, group by route (capped at NUM_ARRIVALS each)
     by_route: dict = defaultdict(list)
     for unix_ts, trip_id in schedule.get(stop_id, []):
         if unix_ts < cutoff:
@@ -250,381 +421,374 @@ def _build_lines(stop_id: str, stop_name: str, rt_idx: dict, now_ts: float) -> l
     if not by_route:
         return ["No upcoming arrivals"]
 
-    # Sort routes numerically where possible, alpha otherwise
-    def _route_sort_key(rid):
-        short = routes.get(rid, rid)
-        try:
-            return (0, int(short), short)
-        except ValueError:
-            return (1, 0, short)
-
-    lines: list[str] = []
-    for route_idx, route_id in enumerate(sorted(by_route, key=_route_sort_key)):
-        short   = routes.get(route_id, route_id)
-        include_stop_name = (route_idx > 0)   # second+ routes show stop name
-
+    lines: list = []
+    for idx, route_id in enumerate(
+            sorted(by_route, key=lambda r: _route_sort_key(r, routes))):
+        short             = routes.get(route_id, route_id)
+        include_stop_name = (idx > 0)
         if lines:
-            lines.append("")   # blank line between route groups
+            lines.append("")
 
         for sched_ts, trip_id in by_route[route_id]:
             sched_str = _fmt(sched_ts)
-
-            # Real-time lookup
-            rt_info = rt_idx.get(trip_id, {}).get(stop_id)
+            rt_info   = rt_idx.get(trip_id, {}).get(stop_id)
             if rt_info:
-                rt_ts  = rt_info["rt_time"]
                 delay  = rt_info.get("delay") or 0
-                rt_str = "On Time" if abs(delay) <= ON_TIME_WINDOW else _fmt(rt_ts)
+                rt_str = "On Time" if abs(delay) <= ON_TIME_WINDOW else _fmt(rt_info["rt_time"])
             else:
                 rt_str = None
 
-            # Assemble line
             parts = [f"Route #{short}"]
             if include_stop_name:
                 parts.append(stop_name)
             parts.append(sched_str)
             if rt_str:
                 parts.append(rt_str)
-
             lines.append(" // ".join(parts))
 
     return lines
 
 
 # ---------------------------------------------------------------------------
-# NEW: Structured arrival data for JSON endpoint
+# JSON arrivals  (for /next-arrival-json — Apple Shortcuts bus-picker)
 # ---------------------------------------------------------------------------
-def _get_arrivals_data(
-    stop_id: str,
-    stop_name: str,
-    rt_idx: dict,
-    now_ts: float,
-    dest_stop_id: str | None = None,
-    dest_stop_name: str | None = None,
-) -> list[dict]:
+
+def _build_arrivals_json(stop_id: str, stop_name: str,
+                          rt_idx: dict, now_ts: float,
+                          stop_lat, stop_lon) -> dict:
     """
-    Returns structured arrival data as a list of dicts.
-    If dest_stop_id is provided, each arrival includes when
-    that same trip reaches the destination stop (from GTFS schedule).
+    Returns dict ready for JSONResponse.
+    Key fields callers need:
+      menu_items  : list of strings, one per upcoming bus, for Shortcuts
+                    "Choose from List".  Split on ' // ' → 4 parts:
+                    [route_label, scheduled_time, status, minutes_until]
+      arrivals    : full detail dicts (departure_unix, etc.)
     """
     cutoff   = now_ts - GRACE_SECONDS
     schedule = _gtfs["schedule"]
     trips    = _gtfs["trips"]
     routes   = _gtfs["routes"]
 
-    # Build a quick lookup for the destination stop's schedule:
-    # {trip_id: unix_ts} for the destination
-    dest_by_trip: dict = {}
-    if dest_stop_id:
-        for dest_ts, dest_tid in schedule.get(dest_stop_id, []):
-            dest_by_trip[dest_tid] = dest_ts
-
-    # Count arrivals per route to cap at NUM_ARRIVALS
-    route_counts: dict = defaultdict(int)
-    arrivals: list[dict] = []
-
+    by_route: dict = defaultdict(list)
     for unix_ts, trip_id in schedule.get(stop_id, []):
         if unix_ts < cutoff:
             continue
+        route_id = trips.get(trip_id, {}).get("route_id", "?")
+        if len(by_route[route_id]) < NUM_ARRIVALS:
+            by_route[route_id].append((unix_ts, trip_id))
 
-        route_id    = trips.get(trip_id, {}).get("route_id", "?")
-        route_short = routes.get(route_id, route_id)
-
-        if route_counts[route_id] >= NUM_ARRIVALS:
-            continue
-        route_counts[route_id] += 1
-
-        # --- Real-time data for boarding stop ---
-        rt_info = rt_idx.get(trip_id, {}).get(stop_id)
-        if rt_info:
-            rt_ts   = rt_info["rt_time"]
-            delay   = rt_info.get("delay") or 0
-            if abs(delay) <= ON_TIME_WINDOW:
-                status  = "on_time"
-            else:
-                status  = "delayed"
-            realtime_str = _fmt(rt_ts)
-            effective_ts = rt_ts  # use real-time for minutes_away
-        else:
-            status       = "no_data"
-            realtime_str = None
-            effective_ts = unix_ts
-
-        minutes_away = max(0, round((effective_ts - now_ts) / 60))
-
-        arrival: dict = {
-            "route":          route_short,
-            "trip_id":        trip_id,
-            "scheduled":      _fmt(unix_ts),
-            "scheduled_unix": unix_ts,
-            "minutes_away":   minutes_away,
-            "status":         status,
+    if not by_route:
+        return {
+            "stop_name":  stop_name,
+            "stop_id":    stop_id,
+            "stop_lat":   stop_lat,
+            "stop_lon":   stop_lon,
+            "arrivals":   [],
+            "menu_items": [],
+            "error":      "No upcoming arrivals",
         }
-        if realtime_str:
-            arrival["realtime"] = realtime_str
 
-        # --- Destination lookup (same trip, different stop) ---
-        if dest_stop_id and trip_id in dest_by_trip:
-            dest_sched_ts = dest_by_trip[trip_id]
-            ride_minutes  = max(0, round((dest_sched_ts - unix_ts) / 60))
+    arrivals:   list = []
+    menu_items: list = []
 
-            arrival["dest_stop_name"]   = dest_stop_name or dest_stop_id
-            arrival["dest_arrival"]     = _fmt(dest_sched_ts)
-            arrival["dest_arrival_unix"] = dest_sched_ts
-            arrival["ride_minutes"]     = ride_minutes
+    for route_id in sorted(by_route,
+                            key=lambda r: _route_sort_key(r, routes)):
+        short = routes.get(route_id, route_id)
 
-            # Real-time for destination stop too
-            dest_rt = rt_idx.get(trip_id, {}).get(dest_stop_id)
-            if dest_rt:
-                arrival["dest_realtime"]     = _fmt(dest_rt["rt_time"])
-                arrival["dest_arrival_unix"] = dest_rt["rt_time"]
-                ride_minutes_rt = max(0, round((dest_rt["rt_time"] - effective_ts) / 60))
-                arrival["ride_minutes"] = ride_minutes_rt
+        for sched_ts, trip_id in by_route[route_id]:
+            sched_str = _fmt(sched_ts)
 
-            # Total minutes from now until arriving at destination
-            dest_effective = arrival["dest_arrival_unix"]
-            arrival["total_trip_minutes"] = max(0, round((dest_effective - now_ts) / 60))
+            # Real-time
+            rt_info    = rt_idx.get(trip_id, {}).get(stop_id)
+            delay_secs = 0
+            rt_unix    = sched_ts
+            on_time    = None
+            status     = "Scheduled"   # shown in menu_item column 3
 
-        # --- Build label for Shortcuts "Choose from List" ---
-        status_tag = {"on_time": "[On Time]", "delayed": "[Delayed]", "no_data": ""}[status]
-        display_time = realtime_str or arrival["scheduled"]
-        label = f"#{route_short} // {display_time} ({minutes_away} min) {status_tag}"
-        if "ride_minutes" in arrival:
-            label += f" // {arrival['ride_minutes']} min ride"
-        arrival["label"] = label.strip()
+            if rt_info:
+                rt_unix    = rt_info["rt_time"]
+                delay_secs = int(rt_info.get("delay") or 0)
+                on_time    = abs(delay_secs) <= ON_TIME_WINDOW
+                if on_time:
+                    status = "On Time"
+                else:
+                    sign   = "+" if delay_secs > 0 else ""
+                    status = f"{sign}{round(delay_secs / 60)}min"
 
-        arrivals.append(arrival)
+            depart_unix   = rt_unix
+            minutes_until = max(0, round((depart_unix - now_ts) / 60))
 
-    return arrivals
+            # Menu string — split on " // " gives exactly 4 parts:
+            #   0: "Route #9"
+            #   1: "2:19 PM"     (scheduled)
+            #   2: "On Time"     (or "+2min" / "Scheduled")
+            #   3: "14 min"
+            menu_item = (
+                f"Route #{short} // {sched_str} // {status} // {minutes_until} min"
+            )
+
+            entry = {
+                "route":          short,
+                "scheduled_time": sched_str,
+                "scheduled_unix": int(sched_ts),
+                "realtime_time":  _fmt(rt_unix) if rt_info else None,
+                "realtime_unix":  int(rt_unix)  if rt_info else None,
+                "departure_unix": int(depart_unix),
+                "minutes_until":  minutes_until,
+                "delay_seconds":  delay_secs    if rt_info else None,
+                "delay_minutes":  round(delay_secs / 60, 1) if rt_info else None,
+                "on_time":        on_time,
+                "status":         status,
+                "trip_id":        trip_id,
+                "menu_item":      menu_item,
+            }
+            arrivals.append(entry)
+            menu_items.append(menu_item)
+
+    return {
+        "stop_name":  stop_name,
+        "stop_id":    stop_id,
+        "stop_lat":   stop_lat,
+        "stop_lon":   stop_lon,
+        "arrivals":   arrivals,
+        "menu_items": menu_items,
+    }
 
 
 # ---------------------------------------------------------------------------
-def _resolve(raw: str) -> tuple[str | None, str]:
-    """(stop_id, stop_name) or (None, error_msg).
-    Accepts: preset name ('farr'), numeric stop code ('2968'),
-    or alpha stop ID ('SPRSHEEF').
-    """
+# Stop resolver
+# ---------------------------------------------------------------------------
+
+def _resolve(raw: str) -> tuple:
+    """(stop_id, stop_name, lat, lon) or (None, error_msg, None, None)."""
     s = raw.strip()
-
-    # Check preset names first (case-insensitive)
-    preset = PRESET_STOPS.get(s.lower())
-    if preset:
-        s = preset["stop_code"]
-
     if s.isdigit():
         info = _gtfs["stops_by_code"].get(s)
         if not info:
-            return None, f"Stop code {s} not found in schedule data"
-        return info["stop_id"], info["stop_name"]
+            return None, f"Stop code {s} not found in schedule data", None, None
+        return info["stop_id"], info["stop_name"], info.get("lat"), info.get("lon")
     s = s.upper()
     info = _gtfs["stops_by_id"].get(s)
     if not info:
-        return None, f"Stop ID '{s}' not found in schedule data"
-    return s, info["stop_name"]
+        return None, f"Stop ID '{s}' not found in schedule data", None, None
+    return s, info["stop_name"], info.get("lat"), info.get("lon")
+
 
 # ---------------------------------------------------------------------------
+# High-level helpers used by endpoints
+# ---------------------------------------------------------------------------
+
 def get_arrivals(stop_input: str) -> str:
     err = _ensure_gtfs()
     if err:
         return err
-
-    stop_id, result = _resolve(stop_input)
+    stop_id, result, _, _ = _resolve(stop_input)
     if stop_id is None:
-        return result   # error message
-    stop_name = result
-
-    feed, _ = _fetch_rt()
+        return result
+    feed, _  = _fetch_rt()
     rt_idx   = _build_rt_index(feed) if feed else {}
     now_ts   = datetime.now(timezone.utc).timestamp()
-
-    lines = _build_lines(stop_id, stop_name, rt_idx, now_ts)
+    lines    = _build_lines(stop_id, result, rt_idx, now_ts)
     return "\n".join(lines)
 
+
+def get_arrivals_json(stop_input: str) -> dict:
+    err = _ensure_gtfs()
+    if err:
+        return {"error": err}
+    stop_id, stop_name, lat, lon = _resolve(stop_input)
+    if stop_id is None:
+        return {"error": stop_name}
+    feed, _  = _fetch_rt()
+    rt_idx   = _build_rt_index(feed) if feed else {}
+    now_ts   = datetime.now(timezone.utc).timestamp()
+    return _build_arrivals_json(stop_id, stop_name, rt_idx, now_ts, lat, lon)
+
+
 # ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
 app = FastAPI(title="Spokane Transit Arrival Board", version="5.0.0")
 
 
 @app.on_event("startup")
 def startup_event():
-    """Pre-load GTFS in background so first request isn't slow."""
-    t = threading.Thread(target=_load_gtfs, daemon=True)
-    t.start()
+    """Pre-load GTFS in background so the first request isn't slow."""
+    threading.Thread(target=_load_gtfs, daemon=True).start()
+
+
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    stops_list = "\n".join(
+        f"  {name} — stop {code}" for code, name in HARDCODED_STOPS.items()
+    )
+    return (
+        "Spokane Transit Arrival Board v5\n"
+        "─────────────────────────────────\n"
+        "\n"
+        "Hard-coded stops:\n"
+        f"{stops_list}\n"
+        "\n"
+        "Endpoints:\n"
+        "  GET /next-arrival?stop_id=2968\n"
+        "  GET /next-arrival-json?stop_id=2968      ← JSON for Shortcuts\n"
+        "  GET /schedule?stop_id=2968&date=2025-05-19\n"
+        "  GET /schedule?stop_id=2968&date=2025-05-19&format=json\n"
+        "  GET /stops                                ← list hard-coded stops\n"
+        "  GET /health\n"
+    )
+
+
+@app.get("/stops")
+def stops_list():
+    """Return hard-coded stops as JSON (useful for Shortcuts menus)."""
+    return JSONResponse({
+        "hardcoded_stops": [
+            {"stop_code": code, "name": name}
+            for code, name in HARDCODED_STOPS.items()
+        ]
+    })
 
 
 @app.get("/next-arrival", response_class=PlainTextResponse)
 def next_arrival(
     stop_id: str = Query(
         ...,
-        description="Bus stop number (e.g. 2849) or alpha stop ID (e.g. SPRSHEEF)",
+        description="Stop code (e.g. 2849) or alpha stop ID (e.g. SPRSHEEF)",
         min_length=1,
     )
 ):
+    """Plain-text upcoming arrivals — same format as v4."""
     return get_arrivals(stop_id)
 
 
-# ---------------------------------------------------------------------------
-# NEW: JSON endpoint — returns structured data for Apple Shortcuts
-# ---------------------------------------------------------------------------
-@app.get("/next-arrival-json", response_class=JSONResponse)
+@app.get("/next-arrival-json")
 def next_arrival_json(
     stop_id: str = Query(
         ...,
-        description="Bus stop number (e.g. 2968) or alpha stop ID",
+        description="Stop code or alpha stop ID",
+        min_length=1,
+    )
+):
+    """
+    JSON arrivals designed for Apple Shortcuts.
+
+    Key response fields
+    -------------------
+    menu_items   list[str]   Ready for Shortcuts "Choose from List".
+                             Each string splits into 4 parts on " // ":
+                             [route_label, scheduled_time, status, minutes_until]
+    arrivals     list[dict]  Full detail — departure_unix, on_time, etc.
+    stop_lat     float       Use with "Get Travel Time" in Shortcuts
+    stop_lon     float
+    """
+    return JSONResponse(get_arrivals_json(stop_id))
+
+
+@app.get("/schedule")
+def schedule(
+    stop_id: str = Query(
+        ...,
+        description="Stop code (e.g. 2968) or alpha stop ID",
         min_length=1,
     ),
-    dest_stop_id: str = Query(
-        default=None,
-        description="Optional destination stop to get ride time & arrival ETA",
+    date: str = Query(
+        None,
+        description="Date in YYYY-MM-DD format (default: today Pacific time)",
+    ),
+    format: str = Query(
+        "text",
+        description="Output format: 'text' (default) or 'json'",
     ),
 ):
     """
-    Returns structured JSON with upcoming arrivals.
-    If dest_stop_id is provided, each arrival includes the time
-    that same trip arrives at the destination (actual GTFS data,
-    not a generic estimate).
-
-    Apple Shortcuts usage:
-      1. GET /next-arrival-json?stop_id=2968&dest_stop_id=2849
-      2. Get Dictionary Value → "arrivals"
-      3. Choose from List (shows "label" field for each)
-      4. Get Dictionary Value from chosen item → minutes_away, ride_minutes, etc.
+    Full day timetable for a stop on a given date.
+    Default date is today (Pacific time).
+    Dates must fall within the GTFS feed's active range (typically 30–90 days).
     """
+    # Resolve date
+    if date is None:
+        target_date = datetime.now(PACIFIC).date()
+    else:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            msg = "Invalid date — use YYYY-MM-DD (e.g. 2025-05-19)."
+            return (JSONResponse({"error": msg}, status_code=400)
+                    if format == "json" else PlainTextResponse(msg, status_code=400))
+
+    # Ensure lookup tables are loaded (needed for _resolve)
     err = _ensure_gtfs()
     if err:
-        return JSONResponse({"error": err}, status_code=503)
+        return (JSONResponse({"error": err}, status_code=503)
+                if format == "json" else PlainTextResponse(err, status_code=503))
 
-    # Resolve boarding stop
-    board_id, board_result = _resolve(stop_id)
-    if board_id is None:
-        return JSONResponse({"error": board_result}, status_code=404)
-    board_name = board_result
+    stop_id_resolved, stop_name, _, _ = _resolve(stop_id)
+    if stop_id_resolved is None:
+        return (JSONResponse({"error": stop_name}, status_code=404)
+                if format == "json" else PlainTextResponse(stop_name, status_code=404))
 
-    # Resolve destination stop (optional)
-    dest_id   = None
-    dest_name = None
-    if dest_stop_id:
-        dest_id, dest_result = _resolve(dest_stop_id)
-        if dest_id is None:
-            return JSONResponse({"error": dest_result}, status_code=404)
-        dest_name = dest_result
+    arrivals, err = _get_full_day_schedule(stop_id_resolved, target_date)
+    if err:
+        return (JSONResponse({"error": err}, status_code=503)
+                if format == "json" else PlainTextResponse(err, status_code=503))
 
-    feed, _  = _fetch_rt()
-    rt_idx   = _build_rt_index(feed) if feed else {}
-    now_ts   = datetime.now(timezone.utc).timestamp()
-    now_str  = datetime.now(PACIFIC).strftime("%-I:%M %p")
+    date_label = target_date.strftime("%A, %B %-d %Y")
 
-    arrivals = _get_arrivals_data(
-        board_id, board_name, rt_idx, now_ts,
-        dest_stop_id=dest_id, dest_stop_name=dest_name,
-    )
+    # ── JSON response ──────────────────────────────────────────────────────
+    if format == "json":
+        return JSONResponse({
+            "stop_name":   stop_name,
+            "stop_code":   stop_id,
+            "date":        target_date.isoformat(),
+            "date_label":  date_label,
+            "total_trips": len(arrivals),
+            "arrivals":    arrivals,
+        })
 
-    response = {
-        "stop_name":  board_name,
-        "stop_id":    stop_id,
-        "queried_at": now_str,
-        "arrivals":   arrivals,
-    }
-    if dest_name:
-        response["dest_stop_name"] = dest_name
-        response["dest_stop_id"]   = dest_stop_id
-
+    # ── Plain-text response ────────────────────────────────────────────────
     if not arrivals:
-        response["message"] = "No upcoming arrivals"
+        return PlainTextResponse(
+            f"{stop_name}\n{date_label}\n\nNo service scheduled on this date."
+        )
 
-    return JSONResponse(response, headers={"Cache-Control": "public, max-age=30"})
+    # Group by route, preserve schedule order within each route
+    by_route: dict = defaultdict(list)
+    for a in arrivals:
+        by_route[a["route_short"]].append(a["scheduled_time"])
 
+    def _rs(r):
+        try:
+            return (0, int(r))
+        except ValueError:
+            return (1, r)
 
-# ---------------------------------------------------------------------------
-# NEW: Stop search — find stop codes by name
-# ---------------------------------------------------------------------------
-@app.get("/search-stops", response_class=JSONResponse)
-def search_stops(
-    q: str = Query(
-        ...,
-        description="Search term (e.g. 'sprague', 'sherman', 'plaza')",
-        min_length=2,
-    ),
-):
-    """Search stops by name. Returns matching stops with their codes."""
-    err = _ensure_gtfs()
-    if err:
-        return JSONResponse({"error": err}, status_code=503)
+    lines = [
+        stop_name,
+        date_label,
+        f"({len(arrivals)} trips scheduled)",
+        "",
+    ]
+    for route_short in sorted(by_route, key=_rs):
+        times = by_route[route_short]
+        lines.append(f"Route #{route_short}  ({len(times)} trips):")
+        for i in range(0, len(times), 4):
+            lines.append("  " + "   ".join(times[i:i + 4]))
+        lines.append("")
 
-    query = q.strip().lower()
-    results = []
-    for code, info in _gtfs["stops_by_code"].items():
-        if query in info["stop_name"].lower():
-            results.append({
-                "stop_code": code,
-                "stop_id":   info["stop_id"],
-                "stop_name": info["stop_name"],
-            })
-
-    # Also search by stop_id for stops without codes
-    for sid, info in _gtfs["stops_by_id"].items():
-        if query in info["stop_name"].lower() and info["stop_code"] == "":
-            results.append({
-                "stop_id":   sid,
-                "stop_name": info["stop_name"],
-            })
-
-    results.sort(key=lambda x: x.get("stop_name", ""))
-    return {"query": q, "count": len(results), "stops": results[:25]}
-
-
-# ---------------------------------------------------------------------------
-# Preset stops list
-# ---------------------------------------------------------------------------
-@app.get("/stops", response_class=JSONResponse)
-def list_stops():
-    """Returns the hardcoded preset stops. Use any stop_code or preset
-    name in the stop_id / dest_stop_id parameters of other endpoints."""
-    return {
-        "presets": [
-            {
-                "name": key,
-                "stop_code": val["stop_code"],
-                "label": val["name"],
-            }
-            for key, val in PRESET_STOPS.items()
-        ],
-        "note": "You can also pass any numeric stop code or alpha stop ID.",
-    }
+    return PlainTextResponse("\n".join(lines))
 
 
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     with _lock:
         d = _gtfs["loaded_date"]
-    return f"ok — schedule loaded for {d}" if d else "ok — schedule loading..."
-
-
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return (
-        "Spokane Transit Arrival Board v5\n"
-        "─────────────────────────────────\n"
-        "\n"
-        "PRESET STOPS:\n"
-        "  farr      -> 2968  Sprague @ Farr (Winco)\n"
-        "  sherman   -> 2849  Sprague @ Sherman\n"
-        "  appleway  -> 2884  Appleway @ Farr (Winco)\n"
-        "\n"
-        "PLAIN TEXT:\n"
-        "  GET /next-arrival?stop_id=2968\n"
-        "  GET /next-arrival?stop_id=farr        (preset name works too)\n"
-        "\n"
-        "JSON (for Shortcuts):\n"
-        "  GET /next-arrival-json?stop_id=farr\n"
-        "  GET /next-arrival-json?stop_id=farr&dest_stop_id=sherman\n"
-        "  GET /next-arrival-json?stop_id=2968&dest_stop_id=2849\n"
-        "\n"
-        "STOPS:\n"
-        "  GET /stops                            (list presets)\n"
-        "  GET /search-stops?q=sprague            (search all stops)\n"
-        "\n"
-        "GET /health"
-    )
+    with _zip_lock:
+        z = _zip_cache["fetched_date"]
+    sched_msg = f"schedule loaded for {d}" if d else "schedule loading…"
+    zip_msg   = f"zip cached for {z}"      if z else "zip not yet downloaded"
+    return f"ok — {sched_msg} | {zip_msg}"
 
 
 if __name__ == "__main__":
