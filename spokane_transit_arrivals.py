@@ -524,7 +524,7 @@ def _build_arrivals_json(stop_id: str, stop_name: str,
             #   2: "On Time"     (or "+2min" / "Scheduled")
             #   3: "14 min"
             menu_item = (
-                f"Route #{short}|{sched_str}|{status}|{minutes_until} min"
+                f"Route #{short}|{sched_str}|{status}|{minutes_until} min|{trip_id}"
             )
 
             entry = {
