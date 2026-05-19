@@ -633,6 +633,8 @@ def root():
         "Endpoints:\n"
         "  GET /next-arrival?stop_id=2968\n"
         "  GET /next-arrival-json?stop_id=2968      ← JSON for Shortcuts\n"
+        "  GET /eta-routes                           ← ETA route menu list\n"\
+        "  GET /eta-plan?from_stop=2968&to_stop=2849&trip_id=XXXX\n"\
         "  GET /schedule?stop_id=2968&date=2025-05-19\n"
         "  GET /schedule?stop_id=2968&date=2025-05-19&format=json\n"
         "  GET /stops                                ← list hard-coded stops\n"
@@ -778,6 +780,110 @@ def schedule(
         lines.append("")
 
     return PlainTextResponse("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Hard-coded ETA routes  (for Shortcuts ETA shortcut)
+# ---------------------------------------------------------------------------
+ETA_ROUTES = [
+    {
+        "id":           "farr_to_sherman",
+        "label":        "Sprague @ Farr → Sprague @ Sherman",
+        "from_code":    "2968",
+        "to_code":      "2849",
+        "from_name":    "Sprague @ Farr (Winco)",
+        "to_name":      "Sprague @ Sherman",
+        "dest_address": "Elson S. Floyd College of Medicine, 412 E Spokane Falls Blvd, Spokane, WA",
+    },
+    {
+        "id":           "sherman_to_appleway",
+        "label":        "Sprague @ Sherman → Appleway @ Farr",
+        "from_code":    "2849",
+        "to_code":      "2884",
+        "from_name":    "Sprague @ Sherman",
+        "to_name":      "Appleway @ Farr (Winco)",
+        "dest_address": "9717 E Mn Lane, Spokane Valley, WA",
+    },
+]
+
+
+@app.get("/eta-routes")
+def eta_routes():
+    """Return the hard-coded ETA route options for the Shortcuts menu."""
+    return JSONResponse({
+        "routes": [{"id": r["id"], "label": r["label"]} for r in ETA_ROUTES]
+    })
+
+
+@app.get("/eta-plan")
+def eta_plan(
+    from_stop: str = Query(..., description="Departure stop code, e.g. 2968"),
+    to_stop:   str = Query(..., description="Arrival stop code, e.g. 2849"),
+    trip_id:   str = Query(..., description="Trip ID selected by user from /next-arrival-json"),
+):
+    """
+    Given a chosen trip, return the scheduled ride time between two stops
+    plus both stops' coordinates so Shortcuts can calculate walk + ride ETA.
+
+    Response fields
+    ---------------
+    ride_minutes      int     Scheduled minutes between from_stop and to_stop
+                              on this trip (null if not found)
+    from_lat/lon      float   Departure stop coordinates
+    to_lat/lon        float   Arrival stop coordinates
+    from_name         str
+    to_name           str
+    depart_time       str     Scheduled departure from from_stop  e.g. "9:39 PM"
+    arrive_time       str     Scheduled arrival   at   to_stop    e.g. "9:47 PM"
+    """
+    err = _ensure_gtfs()
+    if err:
+        return JSONResponse({"error": err}, status_code=503)
+
+    # Resolve both stops
+    from_id, from_name, from_lat, from_lon = _resolve(from_stop)
+    if from_id is None:
+        return JSONResponse({"error": from_name}, status_code=404)
+
+    to_id, to_name, to_lat, to_lon = _resolve(to_stop)
+    if to_id is None:
+        return JSONResponse({"error": to_name}, status_code=404)
+
+    # Find scheduled times for this trip at both stops
+    schedule = _gtfs["schedule"]
+    from_ts = None
+    to_ts   = None
+
+    for unix_ts, tid in schedule.get(from_id, []):
+        if tid == trip_id:
+            from_ts = unix_ts
+            break
+
+    for unix_ts, tid in schedule.get(to_id, []):
+        if tid == trip_id:
+            to_ts = unix_ts
+            break
+
+    ride_minutes = None
+    arrive_time  = None
+    depart_time  = _fmt(from_ts) if from_ts else None
+
+    if from_ts is not None and to_ts is not None:
+        ride_minutes = max(1, round((to_ts - from_ts) / 60))
+        arrive_time  = _fmt(to_ts)
+
+    return JSONResponse({
+        "trip_id":      trip_id,
+        "from_name":    from_name,
+        "to_name":      to_name,
+        "from_lat":     from_lat,
+        "from_lon":     from_lon,
+        "to_lat":       to_lat,
+        "to_lon":       to_lon,
+        "depart_time":  depart_time,
+        "arrive_time":  arrive_time,
+        "ride_minutes": ride_minutes,
+    })
 
 
 @app.get("/health", response_class=PlainTextResponse)
