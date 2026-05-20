@@ -61,10 +61,14 @@ GRACE_SECONDS  = 60      # seconds in the past still counted as "upcoming"
 ON_TIME_WINDOW = 60      # delay ≤ this many seconds = "On Time"
 
 # Hard-coded stops  stop_code → display name
+# All four stops used across both commute directions
+# Westbound (home → ESFCOM): 2968 → 3007
+# Eastbound (ESFCOM → home): 2849 → 2884
 HARDCODED_STOPS: OrderedDict = OrderedDict([
-    ("2968", "Sprague @ Farr (Winco)"),
-    ("2849", "Sprague @ Sherman"),
-    ("2884", "Appleway @ Farr (Winco)"),
+    ("2968", "Sprague @ Farr (Winco) [WB]"),   # westbound — board here to go to school
+    ("3007", "Sprague @ Sherman [WB]"),          # westbound — alight here for ESFCOM
+    ("2849", "Sprague @ Sherman [EB]"),          # eastbound — board here to go home
+    ("2884", "Appleway @ Farr (Winco) [EB]"),   # eastbound — alight here coming home
 ])
 
 # ---------------------------------------------------------------------------
@@ -785,23 +789,25 @@ def schedule(
 # ---------------------------------------------------------------------------
 # Hard-coded ETA routes  (for Shortcuts ETA shortcut)
 # ---------------------------------------------------------------------------
+# Westbound (to school): Sprague @ Farr WB (2968) → Sprague @ Sherman WB (3007)
+# Eastbound (from school): Sprague @ Sherman EB (2849) → Appleway @ Farr EB (2884)
 ETA_ROUTES = [
     {
-        "id":           "farr_to_sherman",
-        "label":        "Sprague @ Farr → Sprague @ Sherman",
+        "id":           "to_school",
+        "label":        "Home → ESFCOM (Sprague @ Farr WB → Sherman WB)",
         "from_code":    "2968",
-        "to_code":      "2849",
-        "from_name":    "Sprague @ Farr (Winco)",
-        "to_name":      "Sprague @ Sherman",
+        "to_code":      "3007",
+        "from_name":    "Sprague @ Farr (Winco) [WB]",
+        "to_name":      "Sprague @ Sherman [WB]",
         "dest_address": "Elson S. Floyd College of Medicine, 412 E Spokane Falls Blvd, Spokane, WA",
     },
     {
-        "id":           "sherman_to_appleway",
-        "label":        "Sprague @ Sherman → Appleway @ Farr",
+        "id":           "from_school",
+        "label":        "ESFCOM → Home (Sherman EB → Appleway @ Farr EB)",
         "from_code":    "2849",
         "to_code":      "2884",
-        "from_name":    "Sprague @ Sherman",
-        "to_name":      "Appleway @ Farr (Winco)",
+        "from_name":    "Sprague @ Sherman [EB]",
+        "to_name":      "Appleway @ Farr (Winco) [EB]",
         "dest_address": "9717 E Mn Lane, Spokane Valley, WA",
     },
 ]
