@@ -494,6 +494,7 @@ def _build_arrivals_json(stop_id: str, stop_name: str,
 
     arrivals:   list = []
     menu_items: list = []
+    trip_ids:   list = []
 
     for route_id in sorted(by_route,
                             key=lambda r: _route_sort_key(r, routes)):
@@ -528,7 +529,7 @@ def _build_arrivals_json(stop_id: str, stop_name: str,
             #   2: "On Time"     (or "+2min" / "Scheduled")
             #   3: "14 min"
             menu_item = (
-                f"Route {short}  ·  {sched_str}  ·  {status}  ·  {minutes_until} min|{trip_id}"
+                f"Route {short}  ·  {sched_str}  ·  {status}  ·  {minutes_until} min"
             )
 
             entry = {
@@ -548,6 +549,7 @@ def _build_arrivals_json(stop_id: str, stop_name: str,
             }
             arrivals.append(entry)
             menu_items.append(menu_item)
+            trip_ids.append(trip_id)
 
     return {
         "stop_name":  stop_name,
@@ -556,6 +558,7 @@ def _build_arrivals_json(stop_id: str, stop_name: str,
         "stop_lon":   stop_lon,
         "arrivals":   arrivals,
         "menu_items": menu_items,
+        "trip_ids":   trip_ids,
     }
 
 
